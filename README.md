@@ -10,15 +10,18 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite, and **147 tests run in 0.8 seconds** — including nine seeds each driving 500 ticks of
-split-brain checking, and **linearizability verified** over histories recorded under
-partitions, packet loss and leader crashes.
+suite. **155 tests run in about six seconds**, 147 of them in under one — including nine
+seeds each driving 500 ticks of split-brain checking, and **linearizability verified** over
+histories recorded under partitions, packet loss and leader crashes.
 
-> **Status:** consensus core, simulation harness, leader election, log replication, the
-> replicated store, linearizability checking and a crash-safe durable log — now wired into
-> the node — snapshotting with log compaction, and single-server membership changes are
-> done and tested. A gRPC surface is not built, so this runs in simulation only; see
-> [Roadmap](#roadmap). This README does not claim otherwise.
+The same core also runs behind gRPC, so the algorithm that survives all that testing is the
+one that actually serves requests.
+
+> **Status: complete** for what it set out to be — consensus core, deterministic simulation
+> harness, leader election, log replication, linearizability checking, a crash-safe durable
+> log, snapshotting with compaction, single-server membership changes, and a gRPC surface
+> with a real three-node cluster test. What remains are optimisations, listed under
+> [Roadmap](#roadmap).
 
 ---
 
@@ -31,6 +34,7 @@ partitions, packet loss and leader crashes.
 - [Durability](#durability)
 - [Snapshots](#snapshots)
 - [Membership changes](#membership-changes)
+- [Running it for real](#running-it-for-real)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
 - [Roadmap](#roadmap)
@@ -94,11 +98,12 @@ flowchart TD
     Sim -->|"receive(msg)"| Node
     Node -->|"drainCommitted()"| SM["KeyValueStore<br/>replicated state machine"]
 
-    Real["A real server would sit here instead:<br/>sockets, a scheduler, a disk"] -.->|"same interface"| Node
+    Real["RaftServer — the same core<br/>behind gRPC, a scheduler and a disk"] -.->|"same interface"| Node
 ```
 
-The dashed edge is the point: a real server is another driver. The algorithm cannot tell
-the difference, which is why testing it against the simulated one is meaningful.
+The dashed edge is the point, and it is not hypothetical: `RaftServer` drives the same
+class over real sockets. The algorithm cannot tell the difference, which is what makes the
+exhaustive simulation testing meaningful for what actually runs.
 
 ---
 
@@ -108,7 +113,8 @@ the difference, which is why testing it against the simulated one is meaningful.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 147 tests, well under a second.
+No Docker, no services, no configuration. 155 tests: the 147 simulation tests run in
+under a second, and 8 integration tests start a real three-node cluster on real sockets.
 
 ```java
 // Three nodes, seed 42
@@ -314,6 +320,52 @@ and the guard expires with them. Both directions are asserted:
 
 ---
 
+## Running it for real
+
+The same `RaftNode` that the simulation drives also runs behind gRPC. Nothing in the
+algorithm changed to make that work — that is the point of the design.
+
+```mermaid
+flowchart LR
+    subgraph Core["RaftNode — unchanged"]
+        N["tick · receive · propose"]
+    end
+
+    Sim["SimulatedCluster<br/>logical ticks, seeded network"] -->|drives| N
+    Srv["RaftServer<br/>scheduler + gRPC + disk"] -->|drives| N
+```
+
+`RaftServer` supplies the three things the core refuses to own:
+
+- **Time** — a scheduler ticks the node every 50ms, so elections land between 500ms and 1s
+- **Transport** — gRPC, with `RequestVote`, `AppendEntries` and `InstallSnapshot` mapped
+  one-for-one onto the internal messages
+- **Threading** — `RaftNode` is not thread-safe, so every touch happens on one event-loop
+  thread. Outbound RPCs are dispatched off it, because blocking the loop on an unreachable
+  peer would stop heartbeats to *every* peer and cause the very election the RPC was meant
+  to prevent.
+
+The wire schema is deliberately separate from the domain types. Serialising the domain
+directly would make an ordinary refactor of the core a silent, breaking protocol change.
+
+Clients get `Put`, `Get`, `Delete` and `Status`. A request to a non-leader returns
+`ok=false` with a **leader hint** rather than an error — losing leadership is routine, and a
+client that must parse an exception to find the leader will get it wrong.
+
+The integration suite is deliberately small: it proves the driver works, and leaves fault
+tolerance to the simulation, where a partition costs a method call instead of a real
+timeout.
+
+| Property | Test |
+|---|---|
+| Three real nodes elect one leader and all agree | `electsALeaderOverRealSockets` |
+| Writes and reads work through the gRPC API | `writesAndReadsThroughTheApi` |
+| A write reaches every replica's state machine | `writesReplicateToEveryNode` |
+| A follower redirects with a leader hint | `aFollowerRedirectsRatherThanFailing` |
+| The cluster keeps serving after losing a follower | `survivesLosingAFollower` |
+
+---
+
 ## What is verified
 
 Every item below is an assertion in the suite, not a description of intent.
@@ -402,8 +454,9 @@ Built:
       entries have been compacted away
 - [x] **Single-server membership changes**, with the §4.2.3 guard against servers outside
       the configuration disrupting it
-- [x] 147 tests across election safety, log safety, convergence, linearizability, crash
-      recovery, compaction and membership
+- [x] **gRPC surface** — a real three-node cluster, with the same core the simulation drives
+- [x] 155 tests across election safety, log safety, convergence, linearizability, crash
+      recovery, compaction, membership and a real network
 
 Next, in order:
 
@@ -412,11 +465,9 @@ Next, in order:
 - [ ] Follower reads with lease-based consistency, as a measured optimisation over the
       current log-routed reads
 
-The honest gap now is that there is no network surface, so this runs in simulation only.
-The pure core is shaped to accept a real driver — that is the point of the design — but
-until one exists this is a correct Raft implementation you cannot yet deploy. Snapshots are
-also sent whole rather than chunked, which is fine at these state sizes and would not be at
-gigabytes.
+Two things a reader should know before judging this as production software: it has never
+run outside a test, and the throughput optimisations above are all absent. What it is, is a
+correct implementation of the algorithm with the evidence to back that claim.
 
 ---
 

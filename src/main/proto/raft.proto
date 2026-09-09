@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package raftkv;
+
+option java_package = "io.github.ankitnehra6.raftkv.grpc";
+option java_multiple_files = true;
+
+// The Raft RPCs, mirroring the internal Message hierarchy one-for-one.
+//
+// Deliberately a separate schema rather than serialising the domain types directly: the
+// wire format is a compatibility contract that has to evolve independently of the
+// algorithm, and coupling them means a refactor of the core silently becomes a
+// breaking protocol change.
+service Raft {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
+}
+
+message LogEntryProto {
+  uint64 term = 1;
+  uint64 index = 2;
+  // Mirrors LogEntry.Type: 0 COMMAND, 1 NOOP, 2 CONFIGURATION.
+  uint32 type = 3;
+  bytes command = 4;
+}
+
+message RequestVoteRequest {
+  string from = 1;
+  uint64 term = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteReply {
+  string from = 1;
+  uint64 term = 2;
+  bool vote_granted = 3;
+}
+
+message AppendEntriesRequest {
+  string from = 1;
+  uint64 term = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntryProto entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesReply {
+  string from = 1;
+  uint64 term = 2;
+  bool success = 3;
+  uint64 match_index = 4;
+  uint64 conflict_index = 5;
+}
+
+message InstallSnapshotRequest {
+  string from = 1;
+  uint64 term = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotReply {
+  string from = 1;
+  uint64 term = 2;
+  uint64 match_index = 3;
+}

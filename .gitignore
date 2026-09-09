@@ -14,3 +14,8 @@ target/
 
 ### macOS ###
 .DS_Store
+
+### Generated protobuf sources ###
+# Regenerated on every build from src/main/proto; checking them in would let the
+# committed copy drift from the schema.
+target/generated-sources/
