@@ -1,8 +1,10 @@
 package io.github.ankitnehra6.raftkv.log;
 
 import io.github.ankitnehra6.raftkv.core.LogEntry;
+import io.github.ankitnehra6.raftkv.core.Snapshot;
 import java.io.Closeable;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Durable storage for the log and the state that must outlive a restart.
@@ -34,4 +36,15 @@ public interface LogStore extends Closeable {
     void saveState(PersistentState state);
 
     PersistentState loadState();
+
+    /**
+     * Stores a snapshot and discards the log prefix it covers.
+     *
+     * <p>Written before the entries are dropped, and durable before returning. The reverse
+     * order — trim first, then write — has a window in which a crash leaves neither the
+     * entries nor the snapshot, which loses committed state outright.
+     */
+    void saveSnapshot(Snapshot snapshot);
+
+    Optional<Snapshot> loadSnapshot();
 }

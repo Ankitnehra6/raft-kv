@@ -1,8 +1,10 @@
 package io.github.ankitnehra6.raftkv.log;
 
 import io.github.ankitnehra6.raftkv.core.LogEntry;
+import io.github.ankitnehra6.raftkv.core.Snapshot;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * A {@link LogStore} that keeps everything in memory.
@@ -17,6 +19,13 @@ public class InMemoryLogStore implements LogStore {
 
     private final List<LogEntry> entries = new ArrayList<>();
     private PersistentState state = PersistentState.INITIAL;
+    private Snapshot snapshot;
+
+    /**
+     * Index of the first entry still held. Rises as snapshots compact the front away, so
+     * the list stays a suffix of the logical log rather than being re-indexed.
+     */
+    private long firstIndex = 1;
 
     @Override
     public void append(List<LogEntry> incoming) {
@@ -33,10 +42,10 @@ public class InMemoryLogStore implements LogStore {
 
     @Override
     public void truncateFrom(long index) {
-        if (index < 1 || index > lastIndex()) {
+        if (index < firstIndex || index > lastIndex()) {
             return;
         }
-        entries.subList((int) (index - 1), entries.size()).clear();
+        entries.subList((int) (index - firstIndex), entries.size()).clear();
     }
 
     @Override
@@ -46,7 +55,10 @@ public class InMemoryLogStore implements LogStore {
 
     @Override
     public long lastIndex() {
-        return entries.isEmpty() ? 0 : entries.getLast().index();
+        if (!entries.isEmpty()) {
+            return entries.getLast().index();
+        }
+        return snapshot == null ? 0 : snapshot.lastIncludedIndex();
     }
 
     @Override
@@ -57,6 +69,19 @@ public class InMemoryLogStore implements LogStore {
     @Override
     public PersistentState loadState() {
         return state;
+    }
+
+    @Override
+    public void saveSnapshot(Snapshot toSave) {
+        this.snapshot = toSave;
+        // Drop the prefix the snapshot now covers.
+        entries.removeIf(entry -> entry.index() <= toSave.lastIncludedIndex());
+        firstIndex = toSave.lastIncludedIndex() + 1;
+    }
+
+    @Override
+    public Optional<Snapshot> loadSnapshot() {
+        return Optional.ofNullable(snapshot);
     }
 
     @Override

@@ -2,6 +2,7 @@ package io.github.ankitnehra6.raftkv.log;
 
 import io.github.ankitnehra6.raftkv.core.LogEntry;
 import io.github.ankitnehra6.raftkv.core.NodeId;
+import io.github.ankitnehra6.raftkv.core.Snapshot;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -13,6 +14,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.util.zip.CRC32;
@@ -54,6 +56,7 @@ public class FileLogStore implements LogStore {
 
     private final Path logFile;
     private final Path stateFile;
+    private final Path snapshotFile;
     private final FileChannel channel;
     private final boolean syncOnWrite;
 
@@ -73,6 +76,7 @@ public class FileLogStore implements LogStore {
             Files.createDirectories(directory);
             this.logFile = directory.resolve("raft.log");
             this.stateFile = directory.resolve("raft.state");
+            this.snapshotFile = directory.resolve("raft.snapshot");
             this.channel =
                     FileChannel.open(
                             logFile,
@@ -310,6 +314,97 @@ public class FileLogStore implements LogStore {
             return new PersistentState(term, NodeId.of(new String(votedFor, StandardCharsets.UTF_8)));
         } catch (IOException e) {
             throw new UncheckedIOException("failed to load state from " + stateFile, e);
+        }
+    }
+
+    @Override
+    public void saveSnapshot(Snapshot snapshot) {
+        // The snapshot is made durable *before* the log prefix it replaces is dropped.
+        // Trimming first would leave a window where a crash loses both, which loses
+        // committed state outright.
+        Path temporary = snapshotFile.resolveSibling("raft.snapshot.tmp");
+        byte[] data = snapshot.data();
+
+        ByteBuffer buffer =
+                ByteBuffer.allocate(8 + 8 + 4 + data.length + CRC_BYTES)
+                        .putLong(snapshot.lastIncludedIndex())
+                        .putLong(snapshot.lastIncludedTerm())
+                        .putInt(data.length)
+                        .put(data);
+
+        byte[] payload = new byte[8 + 8 + 4 + data.length];
+        buffer.duplicate().flip().get(payload);
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        buffer.putInt((int) crc.getValue());
+
+        try {
+            try (FileChannel out =
+                    FileChannel.open(
+                            temporary,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.TRUNCATE_EXISTING,
+                            StandardOpenOption.WRITE)) {
+                out.write(buffer.flip());
+                out.force(true);
+            }
+            Files.move(
+                    temporary,
+                    snapshotFile,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+
+            // Now safe to drop the entries the snapshot covers.
+            List<LogEntry> keep =
+                    cached.stream()
+                            .filter(entry -> entry.index() > snapshot.lastIncludedIndex())
+                            .toList();
+            rewrite(keep);
+
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to save snapshot to " + snapshotFile, e);
+        }
+    }
+
+    @Override
+    public Optional<Snapshot> loadSnapshot() {
+        if (!Files.exists(snapshotFile)) {
+            return Optional.empty();
+        }
+        try {
+            byte[] bytes = Files.readAllBytes(snapshotFile);
+            if (bytes.length < 8 + 8 + 4 + CRC_BYTES) {
+                log.log(Level.WARNING, "snapshot file %s is too short; ignoring".formatted(snapshotFile));
+                return Optional.empty();
+            }
+
+            byte[] payload = new byte[bytes.length - CRC_BYTES];
+            System.arraycopy(bytes, 0, payload, 0, payload.length);
+            int storedCrc = ByteBuffer.wrap(bytes, payload.length, CRC_BYTES).getInt();
+
+            CRC32 crc = new CRC32();
+            crc.update(payload);
+            if ((int) crc.getValue() != storedCrc) {
+                // A corrupt snapshot is worse than none: it would be restored as state.
+                log.log(Level.WARNING, "snapshot file %s failed its checksum; ignoring".formatted(snapshotFile));
+                return Optional.empty();
+            }
+
+            ByteBuffer buffer = ByteBuffer.wrap(payload);
+            long lastIncludedIndex = buffer.getLong();
+            long lastIncludedTerm = buffer.getLong();
+            int length = buffer.getInt();
+            if (length < 0 || length > buffer.remaining()) {
+                log.log(Level.WARNING, "snapshot file %s has a bad length; ignoring".formatted(snapshotFile));
+                return Optional.empty();
+            }
+            byte[] data = new byte[length];
+            buffer.get(data);
+
+            return Optional.of(new Snapshot(lastIncludedIndex, lastIncludedTerm, data));
+
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to load snapshot from " + snapshotFile, e);
         }
     }
 

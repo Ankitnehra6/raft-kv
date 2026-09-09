@@ -82,4 +82,25 @@ public sealed interface Message {
             long matchIndex,
             long conflictIndex)
             implements Message {}
+
+    /**
+     * Sent when a follower has fallen so far behind that the entries it needs have been
+     * compacted away.
+     *
+     * <p>Sent whole rather than in chunks. Chunking is what a production implementation
+     * needs for multi-gigabyte state, and it adds a transfer state machine — offsets,
+     * resumption, abandoning a partial transfer when leadership changes — that is worth
+     * writing only once the single-message version is known to be correct.
+     *
+     * @param snapshot the state, and the index and term it stands for
+     */
+    record InstallSnapshot(NodeId from, NodeId to, long term, Snapshot snapshot)
+            implements Message {}
+
+    /**
+     * @param matchIndex the snapshot's last included index, once stored. Reported back so
+     *     the leader advances replication progress the same way it does for entries.
+     */
+    record InstallSnapshotResponse(NodeId from, NodeId to, long term, long matchIndex)
+            implements Message {}
 }

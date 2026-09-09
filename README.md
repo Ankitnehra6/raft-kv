@@ -10,14 +10,15 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite, and **118 tests run in 0.7 seconds** — including nine seeds each driving 500 ticks of
+suite, and **131 tests run in 0.8 seconds** — including nine seeds each driving 500 ticks of
 split-brain checking, and **linearizability verified** over histories recorded under
 partitions, packet loss and leader crashes.
 
 > **Status:** consensus core, simulation harness, leader election, log replication, the
 > replicated store, linearizability checking and a crash-safe durable log — now wired into
-> the node — are done and tested. Snapshotting, membership changes and a gRPC surface are
-> not yet built; see [Roadmap](#roadmap). This README does not claim otherwise.
+> the node — and snapshotting with log compaction are done and tested. Membership changes
+> and a gRPC surface are not yet built; see [Roadmap](#roadmap). This README does not claim
+> otherwise.
 
 ---
 
@@ -28,6 +29,7 @@ partitions, packet loss and leader crashes.
 - [Quickstart](#quickstart)
 - [Linearizability](#linearizability)
 - [Durability](#durability)
+- [Snapshots](#snapshots)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
 - [Roadmap](#roadmap)
@@ -105,7 +107,7 @@ the difference, which is why testing it against the simulated one is meaningful.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 118 tests, well under a second.
+No Docker, no services, no configuration. 131 tests, well under a second.
 
 ```java
 // Three nodes, seed 42
@@ -233,6 +235,42 @@ spliced hybrid.
 
 ---
 
+## Snapshots
+
+Without compaction the log grows forever: a cluster up for a year keeps every write ever
+made, a restarting node replays all of them, and a follower away for an hour is sent an
+hour of history. A snapshot replaces that prefix with the state it produced.
+
+The interesting case is not "a snapshot was taken" but **"a follower needed entries that no
+longer exist"**. When a follower's `nextIndex` falls below the snapshot boundary there is
+nothing left to replicate, so the leader sends `InstallSnapshot` instead — and the follower
+discards its entire local log, because the leader's snapshot is authoritative and anything
+beyond it was by definition never committed.
+
+| Property | Test |
+|---|---|
+| Compaction actually shrinks the log | `compactionDiscardsTheLogPrefix` |
+| The snapshot boundary still answers consistency checks | `theSnapshotBoundaryStillMatches` |
+| A follower too far behind is caught up with state, not entries | `aFollowerTooFarBehindReceivesASnapshot` |
+| A snapshot survives a restart, with no prefix to replay | `aSnapshotSurvivesARestart` |
+| Compaction cannot run ahead of what was applied | `refusesToCompactPastWhatHasBeenApplied` |
+| Restoring **replaces** state rather than merging it | `restoringReplacesRatherThanMerges` |
+| The store stays linearizable while compacting | `staysLinearizableWhileCompacting` |
+
+Three decisions worth naming:
+
+- **The snapshot boundary keeps its term** even though the entry is gone. A follower one
+  entry behind the boundary is the normal case, and the `AppendEntries` consistency check
+  still has to be able to ask about that index.
+- **The snapshot is written before the entries it replaces are dropped.** The reverse order
+  has a window in which a crash leaves neither, which loses committed state outright.
+- **Restoring clears the state machine first.** A snapshot is the complete state at its
+  index; merging would keep a key the leader deleted while this node was away.
+- **Compaction is driver-initiated.** Raft treats commands as opaque bytes, so it cannot
+  serialise the state they produced — only the state machine's owner can.
+
+---
+
 ## What is verified
 
 Every item below is an assertion in the suite, not a description of intent.
@@ -317,21 +355,22 @@ Built:
       recovery from torn writes, atomically-persisted term and vote
 - [x] **Durable log wired into the node** — term and vote persisted before the reply that
       depends on them; restarts rebuild from storage
-- [x] 118 tests across election safety, log safety, convergence, linearizability and
-      crash recovery
+- [x] **Snapshotting and log compaction**, including `InstallSnapshot` for followers whose
+      entries have been compacted away
+- [x] 131 tests across election safety, log safety, convergence, linearizability, crash
+      recovery and compaction
 
 Next, in order:
 
-- [ ] **Snapshotting and log compaction** — the log cannot grow forever
 - [ ] **Membership changes** — single-server add/remove
 - [ ] **gRPC surface** — a real client API and a real network driver, which the pure core
       is already shaped to accept
 - [ ] Follower reads with lease-based consistency, as a measured optimisation over the
       current log-routed reads
 
-The honest gap now is snapshotting: the log grows without bound, so a long-running cluster
-would eventually fill its disk and a rejoining follower would have to replay everything from
-the beginning. Membership changes and a real network surface are also untouched.
+The honest gaps now are membership changes — the cluster is fixed at startup — and a real
+network surface, so this runs only in simulation. Snapshots are also sent whole rather than
+chunked, which is fine for the state sizes here and would not be for gigabytes.
 
 ---
 

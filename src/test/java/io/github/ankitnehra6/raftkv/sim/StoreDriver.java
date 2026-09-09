@@ -68,6 +68,20 @@ final class StoreDriver {
 
     private void applyNewlyCommitted() {
         for (RaftNode node : cluster.nodes()) {
+            // A node that was sent a snapshot must have its state machine replaced before
+            // any further entries are applied on top of it.
+            node.takeSnapshotToRestore()
+                    .ifPresent(
+                            snapshot -> {
+                                stores.get(node.id())
+                                        .restore(snapshot.data(), snapshot.lastIncludedIndex());
+                                // Everything the cluster recorded as applied for this node
+                                // is now covered by the snapshot.
+                                consumed.put(node.id(), cluster.appliedAt(node.id()).size());
+                            });
+        }
+
+        for (RaftNode node : cluster.nodes()) {
             List<LogEntry> all = cluster.appliedAt(node.id());
             int already = consumed.get(node.id());
             if (all.size() <= already) {
@@ -163,5 +177,21 @@ final class StoreDriver {
 
     int outstandingCount() {
         return inFlight.size();
+    }
+
+    /**
+     * Compacts every node's log up to what it has applied.
+     *
+     * <p>Driver-initiated because only the driver knows the state machine: Raft cannot
+     * serialise the result of commands it treats as opaque bytes.
+     */
+    void compactAll() {
+        for (RaftNode node : cluster.nodes()) {
+            KeyValueStore store = stores.get(node.id());
+            long applied = store.lastAppliedIndex();
+            if (applied > node.log().snapshotIndex() && applied <= node.lastApplied()) {
+                node.compact(applied, store.snapshotBytes());
+            }
+        }
     }
 }

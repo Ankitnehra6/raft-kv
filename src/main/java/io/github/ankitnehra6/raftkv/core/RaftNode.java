@@ -61,6 +61,12 @@ public class RaftNode {
     private int ticksSinceHeartbeat;
     private int electionTimeout;
 
+    // --- snapshots ---
+    private Snapshot snapshot;
+
+    /** Set when a leader installs a snapshot here; the driver must restore it and clear it. */
+    private Snapshot pendingRestore;
+
     // --- outputs, drained by the driver ---
     private final List<Message> outbound = new ArrayList<>();
     private final List<LogEntry> committed = new ArrayList<>();
@@ -95,6 +101,17 @@ public class RaftNode {
         PersistentState recovered = store.loadState();
         this.currentTerm = recovered.currentTerm();
         this.votedFor = recovered.votedFor();
+
+        // A recovered snapshot means everything up to its index is already applied; the
+        // node must not re-apply those entries, and no longer has them to re-apply.
+        store.loadSnapshot()
+                .ifPresent(
+                        recoveredSnapshot -> {
+                            this.snapshot = recoveredSnapshot;
+                            this.commitIndex = recoveredSnapshot.lastIncludedIndex();
+                            this.lastApplied = recoveredSnapshot.lastIncludedIndex();
+                            this.pendingRestore = recoveredSnapshot;
+                        });
 
         resetElectionTimer();
     }
@@ -151,6 +168,8 @@ public class RaftNode {
             case Message.RequestVoteResponse m -> onRequestVoteResponse(m);
             case Message.AppendEntries m -> onAppendEntries(m);
             case Message.AppendEntriesResponse m -> onAppendEntriesResponse(m);
+            case Message.InstallSnapshot m -> onInstallSnapshot(m);
+            case Message.InstallSnapshotResponse m -> onInstallSnapshotResponse(m);
         }
     }
 
@@ -175,6 +194,49 @@ public class RaftNode {
         // A single-node cluster has a majority of one, so the entry is already committed.
         advanceCommitIndex();
         return Optional.of(entry.index());
+    }
+
+    // --- snapshots -----------------------------------------------------------------
+
+    /**
+     * Folds the log prefix up to {@code index} into a snapshot supplied by the driver.
+     *
+     * <p>The driver initiates this because only it knows the state machine: Raft has no
+     * idea what the committed commands mean, so it cannot serialise their result. It may
+     * only compact up to what has actually been applied — compacting past that would
+     * discard entries whose effects are not yet in the snapshot.
+     *
+     * @param index the last applied index the snapshot covers
+     * @param stateMachineData the state machine's own serialisation
+     */
+    public void compact(long index, byte[] stateMachineData) {
+        if (index > lastApplied) {
+            throw new IllegalArgumentException(
+                    "cannot compact to %d: only %d has been applied".formatted(index, lastApplied));
+        }
+        if (index <= log.snapshotIndex()) {
+            return; // already covered
+        }
+
+        Snapshot taken = new Snapshot(index, log.termAt(index), stateMachineData);
+        log.store().saveSnapshot(taken);
+        log.compactTo(index, taken.lastIncludedTerm());
+        snapshot = taken;
+    }
+
+    /**
+     * A snapshot this node has installed and the driver must restore into its state
+     * machine. Returns it once, then forgets it.
+     */
+    public Optional<Snapshot> takeSnapshotToRestore() {
+        Optional<Snapshot> pending = Optional.ofNullable(pendingRestore);
+        pendingRestore = null;
+        return pending;
+    }
+
+    /** The most recent snapshot this node holds, if any. */
+    public Optional<Snapshot> snapshot() {
+        return Optional.ofNullable(snapshot);
     }
 
     // --- outputs -----------------------------------------------------------------
@@ -394,12 +456,77 @@ public class RaftNode {
 
     private void sendAppendEntries(NodeId peer) {
         long next = nextIndex.getOrDefault(peer, log.lastIndex() + 1);
+
+        // The entries this follower needs have been compacted away, so there is nothing to
+        // replicate — it has to be given the state instead.
+        if (!log.hasEntriesFrom(next)) {
+            sendSnapshot(peer);
+            return;
+        }
+
         long prevIndex = next - 1;
         long prevTerm = prevIndex == 0 ? 0 : log.termAt(prevIndex);
 
         send(
                 new Message.AppendEntries(
                         id, peer, currentTerm, prevIndex, prevTerm, log.from(next), commitIndex));
+    }
+
+    private void sendSnapshot(NodeId peer) {
+        if (snapshot == null) {
+            // Nothing to send. This can only happen if compaction ran without a snapshot
+            // being recorded, which would be a bug in the driver rather than a state to
+            // recover from.
+            return;
+        }
+        send(new Message.InstallSnapshot(id, peer, currentTerm, snapshot));
+    }
+
+    private void onInstallSnapshot(Message.InstallSnapshot m) {
+        if (m.term() < currentTerm) {
+            return; // a stale leader
+        }
+
+        role = Role.FOLLOWER;
+        leaderId = m.from();
+        resetElectionTimer();
+
+        Snapshot incoming = m.snapshot();
+
+        // An older snapshot than one already held carries nothing new, and installing it
+        // would move this node backwards.
+        if (incoming.lastIncludedIndex() <= log.snapshotIndex()) {
+            send(
+                    new Message.InstallSnapshotResponse(
+                            id, m.from(), currentTerm, log.snapshotIndex()));
+            return;
+        }
+
+        // Everything local is discarded. The leader's snapshot is authoritative, and any
+        // local entry beyond it was by definition never committed.
+        log.resetToSnapshot(incoming.lastIncludedIndex(), incoming.lastIncludedTerm());
+        log.store().saveSnapshot(incoming);
+        snapshot = incoming;
+
+        commitIndex = Math.max(commitIndex, incoming.lastIncludedIndex());
+        lastApplied = incoming.lastIncludedIndex();
+
+        // Handed to the driver, which is the only thing that knows how to restore a state
+        // machine from these bytes.
+        pendingRestore = incoming;
+
+        send(
+                new Message.InstallSnapshotResponse(
+                        id, m.from(), currentTerm, incoming.lastIncludedIndex()));
+    }
+
+    private void onInstallSnapshotResponse(Message.InstallSnapshotResponse m) {
+        if (role != Role.LEADER || m.term() != currentTerm) {
+            return;
+        }
+        matchIndex.put(m.from(), Math.max(matchIndex.getOrDefault(m.from(), 0L), m.matchIndex()));
+        nextIndex.put(m.from(), matchIndex.get(m.from()) + 1);
+        advanceCommitIndex();
     }
 
     /**
