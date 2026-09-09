@@ -18,10 +18,23 @@ public sealed interface Command {
 
     byte PUT = 1;
     byte DELETE = 2;
+    byte GET = 3;
 
     record Put(String key, String value) implements Command {}
 
     record Delete(String key) implements Command {}
+
+    /**
+     * A read, replicated through the log like any write.
+     *
+     * <p>Putting reads in the log is the simplest way to make them linearizable. Serving a
+     * read from the leader's local state is faster and wrong: a leader that has been
+     * deposed without knowing it yet would answer from a stale state machine, and a client
+     * would observe a value that had already been overwritten. Read leases and
+     * ReadIndex are the standard optimisations; both are refinements of this, and neither
+     * is worth adding before the correct version exists to compare against.
+     */
+    record Get(String key) implements Command {}
 
     /** Encodes a command for the replicated log. */
     static byte[] encode(Command command) {
@@ -41,6 +54,10 @@ public sealed interface Command {
                 byte[] k = key.getBytes(StandardCharsets.UTF_8);
                 yield ByteBuffer.allocate(1 + 4 + k.length).put(DELETE).putInt(k.length).put(k).array();
             }
+            case Get(String key) -> {
+                byte[] k = key.getBytes(StandardCharsets.UTF_8);
+                yield ByteBuffer.allocate(1 + 4 + k.length).put(GET).putInt(k.length).put(k).array();
+            }
         };
     }
 
@@ -59,6 +76,7 @@ public sealed interface Command {
         return switch (type) {
             case PUT -> new Put(readString(buffer), readString(buffer));
             case DELETE -> new Delete(readString(buffer));
+            case GET -> new Get(readString(buffer));
             default -> throw new IllegalArgumentException("unknown command type: " + type);
         };
     }

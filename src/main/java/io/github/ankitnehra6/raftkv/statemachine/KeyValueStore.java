@@ -24,23 +24,37 @@ public class KeyValueStore {
      *
      * <p>No-ops are skipped: a new leader appends one to commit its own term, and it
      * carries no meaning for the state machine.
+     *
+     * @return the value observed, for a read; empty for a write or a no-op. Returned from
+     *     {@code apply} rather than read separately afterwards, because the answer a read
+     *     must give is the state <em>at its position in the log</em>, and any later lookup
+     *     could already reflect a write that came after it.
      */
-    public void apply(LogEntry entry) {
+    public Optional<String> apply(LogEntry entry) {
         if (entry.index() <= lastAppliedIndex) {
             // Applying an entry twice would make non-idempotent commands wrong. Entries
             // arrive in order, so anything at or below the high-water mark is a replay.
-            return;
+            return Optional.empty();
         }
         lastAppliedIndex = entry.index();
 
         if (entry.isNoop()) {
-            return;
+            return Optional.empty();
         }
 
-        switch (Command.decode(entry.command())) {
-            case Command.Put(String key, String value) -> data.put(key, value);
-            case Command.Delete(String key) -> data.remove(key);
-        }
+        return switch (Command.decode(entry.command())) {
+            case Command.Put(String key, String value) -> {
+                data.put(key, value);
+                yield Optional.empty();
+            }
+            case Command.Delete(String key) -> {
+                data.remove(key);
+                yield Optional.empty();
+            }
+            // Wrapped so an absent key is distinguishable from "not a read" by the caller,
+            // which tracks reads by log index rather than by inspecting the return.
+            case Command.Get(String key) -> Optional.ofNullable(data.get(key));
+        };
     }
 
     public Optional<String> get(String key) {

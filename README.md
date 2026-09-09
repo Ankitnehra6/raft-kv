@@ -10,13 +10,14 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite, and **67 tests run in 0.36 seconds** — including nine seeds each driving 500 ticks
-of split-brain checking.
+suite, and **95 tests run in 0.4 seconds** — including nine seeds each driving 500 ticks of
+split-brain checking, and **linearizability verified** over histories recorded under
+partitions, packet loss and leader crashes.
 
-> **Status:** consensus core, simulation harness, leader election, log replication and the
-> replicated store are done and tested. Persistence, snapshotting, membership changes and a
-> gRPC surface are not yet built — see [Roadmap](#roadmap). This README does not claim
-> otherwise.
+> **Status:** consensus core, simulation harness, leader election, log replication, the
+> replicated store and linearizability checking are done and tested. Persistence,
+> snapshotting, membership changes and a gRPC surface are not yet built — see
+> [Roadmap](#roadmap). This README does not claim otherwise.
 
 ---
 
@@ -25,6 +26,7 @@ of split-brain checking.
 - [Why simulation testing](#why-simulation-testing)
 - [Architecture](#architecture)
 - [Quickstart](#quickstart)
+- [Linearizability](#linearizability)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
 - [Roadmap](#roadmap)
@@ -102,7 +104,7 @@ the difference, which is why testing it against the simulated one is meaningful.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 67 tests, well under a second.
+No Docker, no services, no configuration. 95 tests, well under a second.
 
 ```java
 // Three nodes, seed 42
@@ -117,6 +119,57 @@ cluster.tick(50);
 cluster.nodes().forEach(n ->
     assertThat(n.log().lastIndex()).isEqualTo(leader.log().lastIndex()));
 ```
+
+---
+
+## Linearizability
+
+Asserting on logs and terms checks that the implementation matches the paper. It does not
+answer the question a *user* has: could a client ever observe something a correct store
+would not produce?
+
+So the test driver records only what clients see — request sent, answer received, as an
+interval — and a checker searches for a sequential ordering that explains every result
+while respecting real-time order.
+
+```
+seed    3: total= 51 completed= 37 reads= 20 pending= 14 -> LINEARIZABLE
+seed   17: total= 33 completed= 33 reads= 16 pending=  0 -> LINEARIZABLE
+seed   42: total= 48 completed= 39 reads= 21 pending=  9 -> LINEARIZABLE
+seed  128: total= 45 completed= 37 reads= 18 pending=  8 -> LINEARIZABLE
+seed  999: total= 51 completed= 37 reads= 14 pending= 14 -> LINEARIZABLE
+```
+
+Those runs each survive twenty-five rounds of partitions, leader kills and 5% packet loss.
+
+**Reads go through the log.** Serving a read from the leader's local state is faster and
+wrong: a leader deposed without knowing it would answer from a stale state machine, and a
+client would see a value that had already been overwritten. ReadIndex and leases are the
+standard optimisations — both are refinements of this, and neither is worth adding before
+a correct version exists to compare against.
+
+**The checker is itself tested.** A checker that always answers "linearizable" would make
+every other test pass while proving nothing, so five tests assert that it *rejects*
+histories which are genuinely impossible:
+
+| Impossible history | Test |
+|---|---|
+| A read returns a value nothing ever wrote | `rejectsAValueThatWasNeverWritten` |
+| A read after a completed write sees the old value | `rejectsAStaleReadAfterACompletedWrite` |
+| Two sequential reads go backwards in time | `rejectsReadsThatGoBackwardsInTime` |
+| A deleted key is still readable | `rejectsAReadOfADeletedKey` |
+| Two clients disagree about a settled value | `rejectsTwoClientsDisagreeingAboutASettledValue` |
+
+Three details that make it sound rather than merely convenient:
+
+- **Exceeding the search budget reports `UNKNOWN`, never success.** A checker that gives up
+  and says "fine" converts an unproven claim into a false one.
+- **Pending operations are kept.** A write whose response was lost may still have been
+  applied, so the checker must be free to place it anywhere — or nowhere. Dropping them
+  would produce false violations.
+- **The tests refuse to pass vacuously.** `assertMeaningful` fails the run if it produced
+  too few operations or too few completed reads, because reads are where a stale answer
+  would show up.
 
 ---
 
@@ -197,7 +250,10 @@ Built:
 - [x] Leader election with randomised timeouts and the §5.4.1 up-to-date restriction
 - [x] Log replication, commit advancement, conflict hints
 - [x] Replicated key-value state machine with length-prefixed command encoding
-- [x] 67 tests across election safety, log safety and convergence
+- [x] **Linearizability checking** — Wing & Gong search, partitioned per key, memoised,
+      budget-bounded; and the checker is itself tested against impossible histories
+- [x] Linearizable reads, routed through the log
+- [x] 95 tests across election safety, log safety, convergence and linearizability
 
 Next, in order:
 
@@ -207,12 +263,11 @@ Next, in order:
 - [ ] **Membership changes** — single-server add/remove
 - [ ] **gRPC surface** — a real client API and a real network driver, which the pure core
       is already shaped to accept
-- [ ] **Linearizability checking** over recorded histories, so correctness is verified
-      rather than argued
-- [ ] Follower reads with lease-based consistency
+- [ ] Follower reads with lease-based consistency, as a measured optimisation over the
+      current log-routed reads
 
-The last two are the ones that separate "read the paper" from "implemented it", and they
-are not done yet.
+Persistence is the significant remaining gap: everything here survives partitions and
+crashes *within a run*, but a process restart loses the log.
 
 ---
 
