@@ -10,13 +10,13 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite, and **95 tests run in 0.4 seconds** — including nine seeds each driving 500 ticks of
+suite, and **109 tests run in 0.6 seconds** — including nine seeds each driving 500 ticks of
 split-brain checking, and **linearizability verified** over histories recorded under
 partitions, packet loss and leader crashes.
 
 > **Status:** consensus core, simulation harness, leader election, log replication, the
-> replicated store and linearizability checking are done and tested. Persistence,
-> snapshotting, membership changes and a gRPC surface are not yet built — see
+> replicated store, linearizability checking and a crash-safe durable log are done and
+> tested. Snapshotting, membership changes and a gRPC surface are not yet built — see
 > [Roadmap](#roadmap). This README does not claim otherwise.
 
 ---
@@ -27,6 +27,7 @@ partitions, packet loss and leader crashes.
 - [Architecture](#architecture)
 - [Quickstart](#quickstart)
 - [Linearizability](#linearizability)
+- [Durability](#durability)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
 - [Roadmap](#roadmap)
@@ -104,7 +105,7 @@ the difference, which is why testing it against the simulated one is meaningful.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 95 tests, well under a second.
+No Docker, no services, no configuration. 109 tests, well under a second.
 
 ```java
 // Three nodes, seed 42
@@ -170,6 +171,47 @@ Three details that make it sound rather than merely convenient:
 - **The tests refuse to pass vacuously.** `assertMeaningful` fails the run if it produced
   too few operations or too few completed reads, because reads are where a stale answer
   would show up.
+
+---
+
+## Durability
+
+The log is append-only on disk, with every record length-prefixed and CRC-checked:
+
+```
+payloadLength (4) | term (8) | index (8) | commandLength (4) | command | crc32 (4)
+```
+
+`append` fsyncs before returning, because Raft counts a follower as having stored an entry
+only once it acknowledges it — and a follower that acknowledges something still sitting in
+a page cache can lose it in a power failure, after the leader has already told a client the
+write succeeded.
+
+Recovery assumes a crash can happen at any byte. A record half-written when the power went
+out fails either its length check or its checksum, and recovery stops there, keeping every
+record before it. That is safe precisely because such an entry was never acknowledged, so
+no client was ever told it committed.
+
+Tested by damaging the file directly and reopening it — waiting for a real power failure is
+not a test strategy:
+
+| Damage | Test |
+|---|---|
+| Trailing record cut short mid-write | `recoversFromATornTrailingRecord` |
+| A bit flipped inside a record's payload | `detectsACorruptedRecordByChecksum` |
+| A garbage length prefix claiming 2 GB | `rejectsAnImplausibleRecordLength` |
+| Appending again after recovering from damage | `canAppendAfterRecoveringFromATornTail` |
+| A truncated state file | `ignoresATruncatedStateFile` |
+
+`currentTerm` and `votedFor` are persisted too, and via an atomic rename rather than an
+in-place write. Losing either breaks *safety*, not just progress: a node that forgets its
+term can accept a stale leader, and one that forgets its vote can vote twice in a term and
+help elect a second leader.
+
+Truncation — which happens when a leader overwrites a follower's divergent suffix — rewrites
+the file and moves it into place atomically. Slower than seeking, and far easier to reason
+about: a crash mid-rewrite leaves either the whole old log or the whole new one, never a
+spliced hybrid.
 
 ---
 
@@ -253,12 +295,16 @@ Built:
 - [x] **Linearizability checking** — Wing & Gong search, partitioned per key, memoised,
       budget-bounded; and the checker is itself tested against impossible histories
 - [x] Linearizable reads, routed through the log
-- [x] 95 tests across election safety, log safety, convergence and linearizability
+- [x] **Crash-safe durable log** — CRC-checked records, fsync before acknowledgement,
+      recovery from torn writes, atomically-persisted term and vote
+- [x] 109 tests across election safety, log safety, convergence, linearizability and
+      crash recovery
 
 Next, in order:
 
-- [ ] **Durable log** — memory-mapped `FileChannel` with proven `fsync` boundaries, and
-      crash recovery tested by restarting a node mid-write
+- [ ] **Wire the durable log into `RaftNode`** — `FileLogStore` is built and tested, but
+      the node still holds its log in memory. The seam is `LogStore`; the work is the
+      write-ordering discipline around it, not the storage.
 - [ ] **Snapshotting and log compaction** — the log cannot grow forever
 - [ ] **Membership changes** — single-server add/remove
 - [ ] **gRPC surface** — a real client API and a real network driver, which the pure core
@@ -266,8 +312,9 @@ Next, in order:
 - [ ] Follower reads with lease-based consistency, as a measured optimisation over the
       current log-routed reads
 
-Persistence is the significant remaining gap: everything here survives partitions and
-crashes *within a run*, but a process restart loses the log.
+The honest gap now is that `FileLogStore` exists and is tested, but `RaftNode` does not
+use it yet — so a cluster still keeps its log in memory. Snapshotting and membership
+changes are untouched.
 
 ---
 
