@@ -36,8 +36,20 @@ import java.util.random.RandomGenerator;
 public class RaftNode {
 
     private final NodeId id;
-    private final Set<NodeId> peers;
     private final RaftConfig config;
+
+    /**
+     * The membership this node is currently operating under.
+     *
+     * <p>Adopted the moment a configuration entry is <em>appended</em>, not when it commits.
+     * That is the rule from §4.1 of the dissertation, and it is what prevents a window in
+     * which some nodes count majorities under the old configuration and some under the new
+     * one — which would allow two leaders in the same term.
+     */
+    private ClusterConfig cluster;
+
+    /** The configuration in force before any entry in the log; the bootstrap membership. */
+    private final ClusterConfig bootstrapConfig;
     private final RandomGenerator random;
     private final RaftLog log;
 
@@ -93,7 +105,12 @@ public class RaftNode {
             throw new IllegalArgumentException("peers must not include this node: " + id);
         }
         this.id = id;
-        this.peers = Set.copyOf(peers);
+
+        Set<NodeId> members = new HashSet<>(peers);
+        members.add(id);
+        this.bootstrapConfig = new ClusterConfig(members);
+        this.cluster = bootstrapConfig;
+
         this.config = config;
         this.random = random;
         this.log = new RaftLog(store);
@@ -113,7 +130,29 @@ public class RaftNode {
                             this.pendingRestore = recoveredSnapshot;
                         });
 
+        // The log may already contain configuration changes from before the restart, and
+        // the latest of them is the membership this node must come back under.
+        adoptLatestConfiguration();
+
         resetElectionTimer();
+    }
+
+    /**
+     * Recomputes the active configuration from the log.
+     *
+     * <p>Called after any change to the log, including truncation: when a leader overwrites
+     * a divergent suffix that contained a configuration change, this node must fall back to
+     * whatever configuration preceded it rather than keep operating under one that no longer
+     * exists.
+     */
+    private void adoptLatestConfiguration() {
+        ClusterConfig latest = bootstrapConfig;
+        for (LogEntry entry : log.entries()) {
+            if (entry.isConfiguration()) {
+                latest = ClusterConfig.decode(entry.command());
+            }
+        }
+        cluster = latest;
     }
 
     /**
@@ -139,7 +178,7 @@ public class RaftNode {
             ticksSinceHeartbeat++;
             if (ticksSinceHeartbeat >= config.heartbeatIntervalTicks()) {
                 ticksSinceHeartbeat = 0;
-                peers.forEach(this::sendAppendEntries);
+                peers().forEach(this::sendAppendEntries);
             }
             return;
         }
@@ -154,6 +193,23 @@ public class RaftNode {
     public void receive(Message message) {
         if (!message.to().equals(id)) {
             throw new IllegalArgumentException("message for %s delivered to %s".formatted(message.to(), id));
+        }
+
+        // §4.2.3: ignore a vote request outright while a leader is known to be healthy.
+        //
+        // Checked *before* the term rule, which is the whole point. A server that has been
+        // removed from the configuration, or provisioned but never added, never hears from
+        // the leader, so it times out and campaigns with an ever-higher term. Merely
+        // refusing it the vote would not help: the term rule would already have forced the
+        // real leader to step down, and the cluster would churn through elections
+        // indefinitely while making no progress.
+        //
+        // Discarding the message is safe because a genuine leader failure stops the
+        // heartbeats, and this guard expires with them.
+        if (message instanceof Message.RequestVote
+                && leaderId != null
+                && ticksSinceHeardFromLeader < config.electionTimeoutMinTicks()) {
+            return;
         }
 
         // Rule for all servers: any message carrying a higher term means this node is
@@ -189,11 +245,78 @@ public class RaftNode {
 
         // Replicate immediately rather than waiting for the next heartbeat, so a quiet
         // cluster does not add up to a heartbeat interval of latency to every write.
-        peers.forEach(this::sendAppendEntries);
+        peers().forEach(this::sendAppendEntries);
 
         // A single-node cluster has a majority of one, so the entry is already committed.
         advanceCommitIndex();
         return Optional.of(entry.index());
+    }
+
+    // --- membership ------------------------------------------------------------------
+
+    /**
+     * Adds a server to the cluster.
+     *
+     * <p>One server at a time, deliberately. Arbitrary changes need joint consensus, because
+     * going from {a,b,c} to {c,d,e} in one step lets {a,b} and {d,e} form disjoint
+     * majorities and elect two leaders. Changing membership by one keeps the old and new
+     * majorities overlapping, which makes that impossible without the extra machinery.
+     *
+     * @return the index of the configuration entry, or empty if this node is not the leader
+     *     or a change is already in flight
+     */
+    public Optional<Long> addServer(NodeId node) {
+        return changeMembership(cluster.with(node));
+    }
+
+    /** Removes a server. Same one-at-a-time restriction, for the same reason. */
+    public Optional<Long> removeServer(NodeId node) {
+        if (!cluster.contains(node)) {
+            return Optional.empty();
+        }
+        if (cluster.size() == 1) {
+            throw new IllegalArgumentException("cannot remove the last member of a cluster");
+        }
+        return changeMembership(cluster.without(node));
+    }
+
+    private Optional<Long> changeMembership(ClusterConfig target) {
+        if (role != Role.LEADER) {
+            return Optional.empty();
+        }
+        if (target.equals(cluster)) {
+            return Optional.empty(); // nothing to do
+        }
+        if (hasUncommittedConfiguration()) {
+            // Overlapping changes are what joint consensus exists to handle. Refusing the
+            // second is the honest alternative to implementing it.
+            return Optional.empty();
+        }
+
+        LogEntry entry =
+                LogEntry.configuration(currentTerm, log.lastIndex() + 1, target.encode());
+        log.append(entry);
+
+        // Adopted immediately, before it commits. Waiting would mean this leader keeps
+        // counting majorities under the old configuration while followers that already have
+        // the entry count under the new one.
+        cluster = target;
+
+        // A newly added server has no replication state yet.
+        for (NodeId peer : peers()) {
+            nextIndex.putIfAbsent(peer, log.lastIndex());
+            matchIndex.putIfAbsent(peer, 0L);
+        }
+
+        peers().forEach(this::sendAppendEntries);
+        advanceCommitIndex();
+        return Optional.of(entry.index());
+    }
+
+    /** Whether a configuration entry exists in the log that has not yet committed. */
+    private boolean hasUncommittedConfiguration() {
+        return log.entries().stream()
+                .anyMatch(entry -> entry.isConfiguration() && entry.index() > commitIndex);
     }
 
     // --- snapshots -----------------------------------------------------------------
@@ -344,6 +467,10 @@ public class RaftNode {
 
         long lastNewIndex = log.appendFrom(m.prevLogIndex(), m.entries());
 
+        // A configuration may have arrived, or a truncation may have removed one. Either
+        // way the membership this node operates under is whatever the log now says.
+        adoptLatestConfiguration();
+
         if (m.leaderCommit() > commitIndex) {
             // Clamped to what this node actually has: the leader may be ahead, and
             // committing an index this log has not received yet would apply nothing and
@@ -415,7 +542,7 @@ public class RaftNode {
             return;
         }
 
-        for (NodeId peer : peers) {
+        for (NodeId peer : peers()) {
             send(new Message.RequestVote(id, peer, currentTerm, log.lastIndex(), log.lastTerm()));
         }
     }
@@ -427,7 +554,7 @@ public class RaftNode {
 
         nextIndex.clear();
         matchIndex.clear();
-        for (NodeId peer : peers) {
+        for (NodeId peer : peers()) {
             // Optimistically assume followers match, and let the consistency check walk
             // back if they do not.
             nextIndex.put(peer, log.lastIndex() + 1);
@@ -440,7 +567,7 @@ public class RaftNode {
         // committed by implication, so this is what unblocks the backlog safely.
         log.append(LogEntry.noop(currentTerm, log.lastIndex() + 1));
 
-        peers.forEach(this::sendAppendEntries);
+        peers().forEach(this::sendAppendEntries);
         advanceCommitIndex(); // single-node clusters commit the no-op immediately
     }
 
@@ -545,7 +672,7 @@ public class RaftNode {
             }
 
             int replicas = 1; // this node stores it
-            for (NodeId peer : peers) {
+            for (NodeId peer : peers()) {
                 if (matchIndex.getOrDefault(peer, 0L) >= candidate) {
                     replicas++;
                 }
@@ -568,11 +695,12 @@ public class RaftNode {
     }
 
     private boolean isMajority(int count) {
-        return count * 2 > clusterSize();
+        return cluster.isMajority(count);
     }
 
-    private int clusterSize() {
-        return peers.size() + 1;
+    /** Everyone but this node, under the configuration currently in force. */
+    private Set<NodeId> peers() {
+        return cluster.peersOf(id);
     }
 
     private void resetElectionTimer() {
@@ -631,9 +759,14 @@ public class RaftNode {
         return Map.copyOf(matchIndex);
     }
 
-    /** Peers this node knows about, excluding itself. */
-    public Set<NodeId> peers() {
-        return new HashSet<>(peers);
+    /** The configuration currently in force. */
+    public ClusterConfig configuration() {
+        return cluster;
+    }
+
+    /** Peers under the current configuration, excluding this node. */
+    public Set<NodeId> knownPeers() {
+        return new HashSet<>(peers());
     }
 
     @Override

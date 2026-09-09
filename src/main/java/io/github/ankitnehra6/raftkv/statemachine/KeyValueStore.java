@@ -40,7 +40,9 @@ public class KeyValueStore {
         }
         lastAppliedIndex = entry.index();
 
-        if (entry.isNoop()) {
+        if (!entry.isCommand()) {
+            // No-ops and configuration changes mean nothing here: the first commits a
+            // leader's term, the second is applied by Raft itself.
             return Optional.empty();
         }
 

@@ -45,8 +45,8 @@ public class FileLogStore implements LogStore {
     // dependencies and a storage layer is not a good reason to acquire the first one.
     private static final Logger log = System.getLogger(FileLogStore.class.getName());
 
-    /** term + index + commandLength. */
-    private static final int HEADER_BYTES = 8 + 8 + 4;
+    /** term + index + type + commandLength. */
+    private static final int HEADER_BYTES = 8 + 8 + 1 + 4;
 
     private static final int LENGTH_PREFIX_BYTES = 4;
     private static final int CRC_BYTES = 4;
@@ -150,10 +150,18 @@ public class FileLogStore implements LogStore {
         ByteBuffer buffer = ByteBuffer.wrap(payload);
         long term = buffer.getLong();
         long index = buffer.getLong();
+        byte typeOrdinal = buffer.get();
         int commandLength = buffer.getInt();
         byte[] command = new byte[commandLength];
         buffer.get(command);
-        return new LogEntry(term, index, command);
+
+        LogEntry.Type[] types = LogEntry.Type.values();
+        if (typeOrdinal < 0 || typeOrdinal >= types.length) {
+            // An unknown type from a newer version cannot be applied safely, and guessing
+            // would diverge this replica from the rest.
+            throw new IllegalStateException("unknown log entry type " + typeOrdinal);
+        }
+        return new LogEntry(term, index, types[typeOrdinal], command);
     }
 
     private static byte[] encode(LogEntry entry) {
@@ -165,6 +173,7 @@ public class FileLogStore implements LogStore {
                 ByteBuffer.allocate(HEADER_BYTES + command.length)
                         .putLong(entry.term())
                         .putLong(entry.index())
+                        .put((byte) entry.type().ordinal())
                         .putInt(command.length)
                         .put(command)
                         .array();

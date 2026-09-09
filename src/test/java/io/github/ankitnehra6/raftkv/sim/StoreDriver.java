@@ -67,6 +67,13 @@ final class StoreDriver {
     }
 
     private void applyNewlyCommitted() {
+        // A server can join the cluster mid-run, so its state machine is created on first
+        // sight rather than only in the constructor.
+        for (RaftNode node : cluster.nodes()) {
+            stores.computeIfAbsent(node.id(), unused -> new KeyValueStore());
+            consumed.putIfAbsent(node.id(), 0);
+        }
+
         for (RaftNode node : cluster.nodes()) {
             // A node that was sent a snapshot must have its state machine replaced before
             // any further entries are applied on top of it.

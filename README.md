@@ -10,15 +10,15 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite, and **131 tests run in 0.8 seconds** — including nine seeds each driving 500 ticks of
+suite, and **147 tests run in 0.8 seconds** — including nine seeds each driving 500 ticks of
 split-brain checking, and **linearizability verified** over histories recorded under
 partitions, packet loss and leader crashes.
 
 > **Status:** consensus core, simulation harness, leader election, log replication, the
 > replicated store, linearizability checking and a crash-safe durable log — now wired into
-> the node — and snapshotting with log compaction are done and tested. Membership changes
-> and a gRPC surface are not yet built; see [Roadmap](#roadmap). This README does not claim
-> otherwise.
+> the node — snapshotting with log compaction, and single-server membership changes are
+> done and tested. A gRPC surface is not built, so this runs in simulation only; see
+> [Roadmap](#roadmap). This README does not claim otherwise.
 
 ---
 
@@ -30,6 +30,7 @@ partitions, packet loss and leader crashes.
 - [Linearizability](#linearizability)
 - [Durability](#durability)
 - [Snapshots](#snapshots)
+- [Membership changes](#membership-changes)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
 - [Roadmap](#roadmap)
@@ -107,7 +108,7 @@ the difference, which is why testing it against the simulated one is meaningful.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 131 tests, well under a second.
+No Docker, no services, no configuration. 147 tests, well under a second.
 
 ```java
 // Three nodes, seed 42
@@ -271,6 +272,48 @@ Three decisions worth naming:
 
 ---
 
+## Membership changes
+
+Membership lives **in the log**, not in a config file. A file could be edited on one machine
+and not another, and the two would compute different majorities — which is precisely how a
+cluster ends up with two leaders that each believe they have one.
+
+Servers are added and removed **one at a time**. Arbitrary changes need joint consensus:
+going from `{a,b,c}` to `{c,d,e}` in one step lets `{a,b}` and `{d,e}` form disjoint
+majorities and elect two leaders. Changing by one keeps the old and new majorities
+overlapping, so that cannot happen. A second change while one is in flight is refused —
+the honest alternative to implementing joint consensus.
+
+A configuration is adopted **the moment its entry is appended**, not when it commits (§4.1).
+Waiting would leave a window in which some nodes count majorities under the old
+configuration and some under the new one.
+
+### A real bug this found
+
+A membership test failed for a reason that had nothing to do with membership. The terms
+told the story:
+
+```
+after  30 ticks: isLeader=true  term=1
+after  60 ticks: isLeader=false term=3
+after  90 ticks: isLeader=false term=6
+after 120 ticks: isLeader=false term=8
+after 150 ticks: isLeader=false term=10
+```
+
+A server had been provisioned but never added to the configuration. It never heard from the
+leader, so it timed out and campaigned with an ever-higher term — and the "higher term means
+step down" rule forced the legitimate leader to abdicate every time. The cluster churned
+through elections making no progress.
+
+This is §4.2.3 of the dissertation, and the fix is to **discard a vote request outright
+while a leader is known to be healthy** — checked *before* the term rule, since refusing the
+vote alone would not help. It is safe because a genuine leader failure stops the heartbeats
+and the guard expires with them. Both directions are asserted:
+`anOutsiderCannotDisruptAHealthyCluster` and `theGuardStillAllowsARealElection`.
+
+---
+
 ## What is verified
 
 Every item below is an assertion in the suite, not a description of intent.
@@ -357,20 +400,23 @@ Built:
       depends on them; restarts rebuild from storage
 - [x] **Snapshotting and log compaction**, including `InstallSnapshot` for followers whose
       entries have been compacted away
-- [x] 131 tests across election safety, log safety, convergence, linearizability, crash
-      recovery and compaction
+- [x] **Single-server membership changes**, with the §4.2.3 guard against servers outside
+      the configuration disrupting it
+- [x] 147 tests across election safety, log safety, convergence, linearizability, crash
+      recovery, compaction and membership
 
 Next, in order:
 
-- [ ] **Membership changes** — single-server add/remove
 - [ ] **gRPC surface** — a real client API and a real network driver, which the pure core
       is already shaped to accept
 - [ ] Follower reads with lease-based consistency, as a measured optimisation over the
       current log-routed reads
 
-The honest gaps now are membership changes — the cluster is fixed at startup — and a real
-network surface, so this runs only in simulation. Snapshots are also sent whole rather than
-chunked, which is fine for the state sizes here and would not be for gigabytes.
+The honest gap now is that there is no network surface, so this runs in simulation only.
+The pure core is shaped to accept a real driver — that is the point of the design — but
+until one exists this is a correct Raft implementation you cannot yet deploy. Snapshots are
+also sent whole rather than chunked, which is fine at these state sizes and would not be at
+gigabytes.
 
 ---
 

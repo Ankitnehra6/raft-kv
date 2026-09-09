@@ -13,7 +13,28 @@ import java.util.Arrays;
  *     opinion on what a command means, which is what makes the same implementation usable
  *     for a key-value store or anything else.
  */
-public record LogEntry(long term, long index, byte[] command) {
+public record LogEntry(long term, long index, Type type, byte[] command) {
+
+    /**
+     * What an entry means to the layers above Raft.
+     *
+     * <p>An explicit type rather than inferring from an empty command. That worked while
+     * no-ops were the only special case, but a configuration entry also has to be
+     * distinguishable, and "empty means no-op" would silently misread one.
+     */
+    public enum Type {
+        /** An opaque command for the state machine. */
+        COMMAND,
+        /** A new leader's entry in its own term, committing nothing. */
+        NOOP,
+        /** A cluster membership change, applied by Raft rather than the state machine. */
+        CONFIGURATION
+    }
+
+    /** Convenience for the common case. */
+    public LogEntry(long term, long index, byte[] command) {
+        this(term, index, Type.COMMAND, command);
+    }
 
     public LogEntry {
         if (term < 0) {
@@ -34,11 +55,25 @@ public record LogEntry(long term, long index, byte[] command) {
 
     /** A no-op entry, used by a new leader to commit its own term. */
     public static LogEntry noop(long term, long index) {
-        return new LogEntry(term, index, new byte[0]);
+        return new LogEntry(term, index, Type.NOOP, new byte[0]);
+    }
+
+    /** A membership change. */
+    public static LogEntry configuration(long term, long index, byte[] encodedConfig) {
+        return new LogEntry(term, index, Type.CONFIGURATION, encodedConfig);
     }
 
     public boolean isNoop() {
-        return command.length == 0;
+        return type == Type.NOOP;
+    }
+
+    public boolean isConfiguration() {
+        return type == Type.CONFIGURATION;
+    }
+
+    /** Whether this entry is meant for the state machine at all. */
+    public boolean isCommand() {
+        return type == Type.COMMAND;
     }
 
     // Records compare arrays by reference, which would make two identical entries unequal
@@ -49,16 +84,19 @@ public record LogEntry(long term, long index, byte[] command) {
         return o instanceof LogEntry other
                 && term == other.term
                 && index == other.index
+                && type == other.type
                 && Arrays.equals(command, other.command);
     }
 
     @Override
     public int hashCode() {
-        return 31 * (31 * Long.hashCode(term) + Long.hashCode(index)) + Arrays.hashCode(command);
+        return 31 * (31 * (31 * Long.hashCode(term) + Long.hashCode(index)) + type.hashCode())
+                + Arrays.hashCode(command);
     }
 
     @Override
     public String toString() {
-        return "LogEntry[term=%d, index=%d, bytes=%d]".formatted(term, index, command.length);
+        return "LogEntry[term=%d, index=%d, %s, bytes=%d]"
+                .formatted(term, index, type, command.length);
     }
 }

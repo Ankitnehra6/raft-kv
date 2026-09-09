@@ -268,6 +268,36 @@ public class SimulatedCluster {
         return stores.get(NodeId.of(id));
     }
 
+    /**
+     * Brings a new server online, ready to be added to the cluster.
+     *
+     * <p>Only starts the process; it is not a member until a leader replicates a
+     * configuration entry including it. That mirrors reality: an operator provisions a
+     * machine, then asks the cluster to accept it.
+     */
+    public RaftNode provision(String id) {
+        NodeId nodeId = NodeId.of(id);
+        if (nodes.containsKey(nodeId)) {
+            throw new IllegalArgumentException("already provisioned: " + id);
+        }
+
+        LogStore store = new InMemoryLogStore();
+        stores.put(nodeId, store);
+
+        Set<NodeId> peers = new java.util.HashSet<>(nodes.keySet());
+        RaftNode node =
+                new RaftNode(
+                        nodeId,
+                        peers,
+                        config,
+                        RANDOM_FACTORY.create(seed ^ nodeId.value().hashCode()),
+                        store);
+
+        nodes.put(nodeId, node);
+        applied.put(nodeId, new ArrayList<>());
+        return node;
+    }
+
     public void setDropRate(double rate) {
         network.setDropRate(rate);
     }
