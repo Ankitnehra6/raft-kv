@@ -13,11 +13,31 @@ import java.util.Optional;
  * convention is kept identical to the paper rather than translated to 0-based and
  * mentally re-translated at every use.
  *
- * <p>In-memory for now; a durable implementation slots in behind the same operations.
+ * <p>Backed by a {@link LogStore}, which is what makes the entries durable. The in-memory
+ * list is a cache of what the store holds: every mutation is written through before the
+ * method returns, so a crash can never leave the store behind the cache. The other order —
+ * cache first, disk later — is what turns an acknowledged write into a lost one.
  */
 public class RaftLog {
 
     private final List<LogEntry> entries = new ArrayList<>();
+    private final LogStore store;
+
+    /** A volatile log, for tests that do not care about durability. */
+    public RaftLog() {
+        this(new InMemoryLogStore());
+    }
+
+    /** Opens a log over a store, recovering whatever it already holds. */
+    public RaftLog(LogStore store) {
+        this.store = store;
+        entries.addAll(store.readAll());
+    }
+
+    /** The store beneath, so a node can persist its term and vote through the same handle. */
+    public LogStore store() {
+        return store;
+    }
 
     /** Index of the last entry, or 0 when the log is empty. */
     public long lastIndex() {
@@ -92,6 +112,9 @@ public class RaftLog {
                     "log must be contiguous: expected index %d, got %d"
                             .formatted(expected, entry.index()));
         }
+        // Durable before it is visible: a caller that sees this return may acknowledge the
+        // entry to a leader, and an acknowledgement of something not yet on disk is a lie.
+        store.append(List.of(entry));
         entries.add(entry);
     }
 
@@ -121,6 +144,7 @@ public class RaftLog {
                 }
                 truncateFrom(index); // conflict: this entry and everything after it goes
             }
+            store.append(List.of(entry));
             entries.add(entry);
         }
         return index;
@@ -131,6 +155,7 @@ public class RaftLog {
         if (index < 1 || index > lastIndex()) {
             return;
         }
+        store.truncateFrom(index);
         entries.subList(toSlot(index), entries.size()).clear();
     }
 

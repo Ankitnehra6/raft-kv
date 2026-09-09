@@ -5,6 +5,8 @@ import io.github.ankitnehra6.raftkv.core.Message;
 import io.github.ankitnehra6.raftkv.core.NodeId;
 import io.github.ankitnehra6.raftkv.core.RaftConfig;
 import io.github.ankitnehra6.raftkv.core.RaftNode;
+import io.github.ankitnehra6.raftkv.log.InMemoryLogStore;
+import io.github.ankitnehra6.raftkv.log.LogStore;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,6 +40,14 @@ public class SimulatedCluster {
 
     private final Map<NodeId, RaftNode> nodes = new LinkedHashMap<>();
     private final Map<NodeId, List<LogEntry>> applied = new LinkedHashMap<>();
+
+    /**
+     * Each node's storage, kept outside the node so it survives a restart — exactly as a
+     * disk does. Without this, "restart" would hand the node back its volatile state and
+     * the test would prove nothing about recovery.
+     */
+    private final Map<NodeId, LogStore> stores = new LinkedHashMap<>();
+    private final long seed;
     private final SimulatedNetwork network;
     private final RandomGenerator random;
     private final RaftConfig config;
@@ -53,6 +63,7 @@ public class SimulatedCluster {
             throw new IllegalArgumentException("cluster needs at least one node");
         }
         this.config = config;
+        this.seed = seed;
         this.random = RANDOM_FACTORY.create(seed);
         this.network = new SimulatedNetwork(random);
 
@@ -67,10 +78,16 @@ public class SimulatedCluster {
             // one generator would make a node's election timeout depend on how many random
             // draws its peers happened to make first, so adding a node would perturb
             // everyone's timing and no scenario would stay reproducible across changes.
+            LogStore store = new InMemoryLogStore();
+            stores.put(id, store);
             nodes.put(
                     id,
                     new RaftNode(
-                            id, peers, config, RANDOM_FACTORY.create(seed ^ id.value().hashCode())));
+                            id,
+                            peers,
+                            config,
+                            RANDOM_FACTORY.create(seed ^ id.value().hashCode()),
+                            store));
             applied.put(id, new ArrayList<>());
         }
     }
@@ -217,8 +234,38 @@ public class SimulatedCluster {
         network.crash(NodeId.of(id));
     }
 
+    /**
+     * Brings a node back up.
+     *
+     * <p>The {@link RaftNode} is rebuilt from its store, so it recovers its term, vote and
+     * log but loses everything volatile — role, commit index, leader, replication progress.
+     * That is what a real restart does, and modelling it any more gently would let a bug in
+     * recovery pass unnoticed.
+     */
     public void restart(String id) {
-        network.restart(NodeId.of(id));
+        NodeId nodeId = NodeId.of(id);
+        if (!network.isCrashed(nodeId)) {
+            return; // already running
+        }
+
+        Set<NodeId> peers =
+                nodes.keySet().stream().filter(other -> !other.equals(nodeId)).collect(Collectors.toSet());
+
+        nodes.put(
+                nodeId,
+                new RaftNode(
+                        nodeId,
+                        peers,
+                        config,
+                        RANDOM_FACTORY.create(seed ^ nodeId.value().hashCode()),
+                        stores.get(nodeId)));
+
+        network.restart(nodeId);
+    }
+
+    /** The storage behind a node, so a test can inspect what actually survived. */
+    public LogStore storeAt(String id) {
+        return stores.get(NodeId.of(id));
     }
 
     public void setDropRate(double rate) {

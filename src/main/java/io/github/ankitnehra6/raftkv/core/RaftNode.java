@@ -1,5 +1,8 @@
 package io.github.ankitnehra6.raftkv.core;
 
+import io.github.ankitnehra6.raftkv.log.InMemoryLogStore;
+import io.github.ankitnehra6.raftkv.log.LogStore;
+import io.github.ankitnehra6.raftkv.log.PersistentState;
 import io.github.ankitnehra6.raftkv.log.RaftLog;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -36,7 +39,7 @@ public class RaftNode {
     private final Set<NodeId> peers;
     private final RaftConfig config;
     private final RandomGenerator random;
-    private final RaftLog log = new RaftLog();
+    private final RaftLog log;
 
     // --- persistent state (would survive a restart) ---
     private long currentTerm;
@@ -63,6 +66,23 @@ public class RaftNode {
     private final List<LogEntry> committed = new ArrayList<>();
 
     public RaftNode(NodeId id, Set<NodeId> peers, RaftConfig config, RandomGenerator random) {
+        this(id, peers, config, random, new InMemoryLogStore());
+    }
+
+    /**
+     * Opens a node over a store, recovering whatever state it already holds.
+     *
+     * <p>A restarted node must come back with the term it had reached, the vote it had
+     * cast and the entries it had accepted. Starting blank would let it vote a second time
+     * in a term it has already voted in, which is one of the two ways a cluster ends up
+     * with two leaders.
+     */
+    public RaftNode(
+            NodeId id,
+            Set<NodeId> peers,
+            RaftConfig config,
+            RandomGenerator random,
+            LogStore store) {
         if (peers.contains(id)) {
             throw new IllegalArgumentException("peers must not include this node: " + id);
         }
@@ -70,7 +90,24 @@ public class RaftNode {
         this.peers = Set.copyOf(peers);
         this.config = config;
         this.random = random;
+        this.log = new RaftLog(store);
+
+        PersistentState recovered = store.loadState();
+        this.currentTerm = recovered.currentTerm();
+        this.votedFor = recovered.votedFor();
+
         resetElectionTimer();
+    }
+
+    /**
+     * Writes term and vote to stable storage.
+     *
+     * <p>Called before any reply that depends on them. The paper is explicit about the
+     * ordering: a node that answers a vote request and only then persists the vote can
+     * crash in between, come back with no memory of it, and vote again in the same term.
+     */
+    private void persistState() {
+        log.store().saveState(new PersistentState(currentTerm, votedFor));
     }
 
     // --- inputs ------------------------------------------------------------------
@@ -168,6 +205,9 @@ public class RaftNode {
             resetElectionTimer();
         }
 
+        // Durable before the reply leaves. A vote the candidate counts but this node
+        // forgets is exactly how a term ends up with two leaders.
+        persistState();
         send(new Message.RequestVoteResponse(id, m.from(), currentTerm, granted));
     }
 
@@ -305,6 +345,7 @@ public class RaftNode {
         votesReceived.clear();
         votesReceived.add(id);
         resetElectionTimer();
+        persistState();
 
         // A single-node cluster elects itself: one vote is already a majority.
         if (isMajority(votesReceived.size())) {
@@ -348,6 +389,7 @@ public class RaftNode {
         leaderId = null;
         votesReceived.clear();
         resetElectionTimer();
+        persistState();
     }
 
     private void sendAppendEntries(NodeId peer) {
