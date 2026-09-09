@@ -263,6 +263,21 @@ public class SimulatedCluster {
         network.restart(nodeId);
     }
 
+    /** Messages currently on the wire, for visualisation. */
+    public List<SimulatedNetwork.InFlightView> inFlight() {
+        return network.inFlightMessages(tick);
+    }
+
+    /** Whether a node is currently down. */
+    public boolean isCrashed(String id) {
+        return network.isCrashed(NodeId.of(id));
+    }
+
+    /** Which partition group a node is in; equal numbers can talk to each other. */
+    public int partitionGroupOf(String id) {
+        return network.partitionGroupOf(NodeId.of(id));
+    }
+
     /** The storage behind a node, so a test can inspect what actually survived. */
     public LogStore storeAt(String id) {
         return stores.get(NodeId.of(id));

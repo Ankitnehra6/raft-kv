@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Raft Visualiser</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗳️</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>Raft</h1>
+      <p class="brand-sub">Every node here is a real <code>RaftNode</code> — the same class the tests drive</p>
+    </div>
+  </div>
+
+  <div class="topbar-meta">
+    <span class="stat-chip">tick <strong id="tick">0</strong></span>
+    <span class="stat-chip">leader <strong id="leader">—</strong></span>
+    <span class="stat-chip">term <strong id="term">0</strong></span>
+    <span class="stat-chip">in flight <strong id="inflight">0</strong></span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Cluster -->
+  <section class="card cluster-card">
+    <div class="card-head">
+      <h2>Cluster</h2>
+      <div class="legend">
+        <span class="legend-item"><i class="dot role-leader"></i>leader</span>
+        <span class="legend-item"><i class="dot role-candidate"></i>candidate</span>
+        <span class="legend-item"><i class="dot role-follower"></i>follower</span>
+        <span class="legend-item"><i class="dot role-crashed"></i>down</span>
+      </div>
+    </div>
+
+    <svg id="cluster" viewBox="0 0 640 360" role="img"
+         aria-label="Cluster diagram showing each node's role, term and messages in flight"></svg>
+
+    <p class="hint" id="cluster-hint">Click a node to crash or restart it.</p>
+  </section>
+
+  <div class="split">
+
+    <!-- Controls -->
+    <section class="card">
+      <div class="card-head"><h2>Controls</h2></div>
+
+      <div class="control-row">
+        <button class="btn btn-primary" id="play">▶ Run</button>
+        <button class="btn" id="step">Step</button>
+        <button class="btn" id="step10">+10 ticks</button>
+      </div>
+
+      <div class="field">
+        <label for="speed">Speed <output id="speed-out">4 ticks/s</output></label>
+        <input type="range" id="speed" min="1" max="30" value="4">
+      </div>
+
+      <div class="control-row">
+        <button class="btn" id="propose">Propose a write</button>
+        <button class="btn" id="heal">Heal network</button>
+      </div>
+
+      <div class="field">
+        <label for="drop">Packet loss <output id="drop-out">0%</output></label>
+        <input type="range" id="drop" min="0" max="50" value="0">
+      </div>
+
+      <div class="field">
+        <label for="delay">Max delay <output id="delay-out">1 tick</output></label>
+        <input type="range" id="delay" min="1" max="8" value="1">
+      </div>
+
+      <div class="field">
+        <label for="partition">Partition (isolate these from the rest)</label>
+        <div class="chip-row" id="partition-chips"></div>
+      </div>
+
+      <div class="control-row">
+        <div class="field field-inline">
+          <label for="size">Nodes</label>
+          <select id="size">
+            <option>3</option>
+            <option selected>5</option>
+            <option>7</option>
+          </select>
+        </div>
+        <button class="btn btn-quiet" id="reset">New cluster</button>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Replicated logs</h2>
+        <span class="hint">filled = committed</span>
+      </div>
+      <div class="logs" id="logs"></div>
+      <p class="note">
+        Entries become committed once a majority stores them. A follower's log may lag or
+        briefly diverge; the leader's version always wins.
+      </p>
+    </section>
+
+  </div>
+
+  <!-- Events -->
+  <section class="card">
+    <div class="card-head"><h2>Events</h2></div>
+    <div class="events" id="events"><p class="empty">Press Run.</p></div>
+  </section>
+
+  <footer class="foot">
+    <span>seed <strong id="seed">—</strong></span>
+    <span><a href="https://github.com/Ankitnehra6/raft-kv" target="_blank" rel="noopener">source</a></span>
+  </footer>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

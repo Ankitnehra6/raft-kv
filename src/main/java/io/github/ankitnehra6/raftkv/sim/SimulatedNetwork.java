@@ -118,6 +118,11 @@ public class SimulatedNetwork {
         return crashed.contains(node);
     }
 
+    /** Which partition group a node is in. Equal numbers can exchange messages. */
+    public int partitionGroupOf(NodeId node) {
+        return partitionGroup.getOrDefault(node, 0);
+    }
+
     // --- traffic ---------------------------------------------------------------------
 
     /** Queues a message, unless it is dropped or cannot cross the network as configured. */
@@ -176,6 +181,37 @@ public class SimulatedNetwork {
     public int inFlightCount() {
         return inFlight.size();
     }
+
+    /**
+     * Messages currently on the wire, for visualisation.
+     *
+     * <p>Exposed because a picture of consensus is mostly a picture of what is in flight:
+     * a vote request crossing the cluster, heartbeats fanning out, a response arriving one
+     * tick too late to matter.
+     *
+     * @param now the current tick, used to report how far along each message is
+     */
+    public List<InFlightView> inFlightMessages(long now) {
+        return inFlight.stream()
+                .map(
+                        f ->
+                                new InFlightView(
+                                        f.message(),
+                                        f.deliverAt(),
+                                        // 0 at send, 1 at delivery, so a renderer can
+                                        // interpolate a position without knowing the delay.
+                                        f.deliverAt() <= now
+                                                ? 1.0
+                                                : 1.0 - (double) (f.deliverAt() - now) / Math.max(1, maxDelayTicks)))
+                .toList();
+    }
+
+    /**
+     * @param message the message in flight
+     * @param deliverAt the tick it lands
+     * @param progress 0.0 at send through 1.0 at delivery
+     */
+    public record InFlightView(Message message, long deliverAt, double progress) {}
 
     public long deliveredCount() {
         return delivered;

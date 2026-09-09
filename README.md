@@ -10,7 +10,7 @@ simulation-tested**.
 
 A five-node cluster runs single-threaded inside a unit test. Partitions, packet loss,
 message reordering and crashes are all inputs. There is not one `Thread.sleep` in the
-suite. **155 tests run in about six seconds**, 147 of them in under one — including nine
+suite. **165 tests run in about six seconds**, 157 of them in under one — including nine
 seeds each driving 500 ticks of split-brain checking, and **linearizability verified** over
 histories recorded under partitions, packet loss and leader crashes.
 
@@ -34,6 +34,7 @@ one that actually serves requests.
 - [Durability](#durability)
 - [Snapshots](#snapshots)
 - [Membership changes](#membership-changes)
+- [Visualiser](#visualiser)
 - [Running it for real](#running-it-for-real)
 - [What is verified](#what-is-verified)
 - [Design decisions](#design-decisions)
@@ -113,8 +114,8 @@ exhaustive simulation testing meaningful for what actually runs.
 ./mvnw test
 ```
 
-No Docker, no services, no configuration. 155 tests: the 147 simulation tests run in
-under a second, and 8 integration tests start a real three-node cluster on real sockets.
+No Docker, no services, no configuration. 165 tests: the simulation suite runs in under a
+second, and 8 integration tests start a real three-node cluster on real sockets.
 
 ```java
 // Three nodes, seed 42
@@ -320,6 +321,44 @@ and the guard expires with them. Both directions are asserted:
 
 ---
 
+## Visualiser
+
+```bash
+./mvnw compile exec:java -Dexec.mainClass=io.github.ankitnehra6.raftkv.viz.VisualizerServer
+# then open http://localhost:8080
+```
+
+![Raft visualiser showing a partitioned five-node cluster with two leaders](docs/images/visualiser.png)
+
+**Every node on screen is a real `RaftNode`** — the same class the test suite hammers and
+the same one `RaftServer` runs behind gRPC. Clicking "crash" calls the method a test calls.
+A visualisation that re-implemented the algorithm in JavaScript would be a *drawing* of
+Raft; this is Raft, rendered.
+
+The screenshot is a deliberate scenario: `n0` and `n1` have been partitioned from the rest.
+`n1` still believes it leads at term 1, while the majority elected `n3` at term 2 — so the
+header honestly reads `leader n1 + n3` rather than picking one. The minority's logs are
+stuck at three entries while the majority moved to four, which is the safety property made
+visible: **a leader without a majority cannot commit.**
+
+What you can do:
+
+- **Click any node** to crash or restart it. A restart rebuilds it from its store, so it
+  recovers term, vote and log but loses role and commit index — as a real one would.
+- **Partition** by selecting nodes, and watch the minority stall.
+- **Add packet loss and delay**, and watch elections still converge.
+- **Propose writes** and watch entries fill in as they commit.
+
+The log strip is the part worth watching. A filled cell is committed — a majority stores
+it and it can never be taken back. Hollow cells are replicated but not yet committed;
+hatched cells were folded into a snapshot; amber cells are membership changes.
+
+The server uses the JDK's own HTTP server and a hand-rolled JSON writer, so the visualiser
+adds no dependency to a project whose argument is that consensus code should be readable
+without a dependency tree behind it.
+
+---
+
 ## Running it for real
 
 The same `RaftNode` that the simulation drives also runs behind gRPC. Nothing in the
@@ -455,8 +494,9 @@ Built:
 - [x] **Single-server membership changes**, with the §4.2.3 guard against servers outside
       the configuration disrupting it
 - [x] **gRPC surface** — a real three-node cluster, with the same core the simulation drives
-- [x] 155 tests across election safety, log safety, convergence, linearizability, crash
-      recovery, compaction, membership and a real network
+- [x] **Interactive visualiser** driving the real cluster, with no added dependency
+- [x] 165 tests across election safety, log safety, convergence, linearizability, crash
+      recovery, compaction, membership, a real network and the visualiser
 
 Next, in order:
 
